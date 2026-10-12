@@ -1,0 +1,6 @@
+{
+  "name": "Trend Finder",
+  "description": "Discover trending YouTube Shorts and viral audio by analyzing Shorts from a custom list of YouTube creators.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

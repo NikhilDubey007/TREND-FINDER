@@ -1,0 +1,126 @@
+{
+  "entities": {
+    "Creator": {
+      "title": "Creator",
+      "description": "YouTube creator whose Shorts are tracked and analyzed for viral audio",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "YouTube Channel ID or stable creator identifier" },
+        "name": { "type": "string", "description": "Channel display name" },
+        "enabled": { "type": "boolean", "description": "Whether this creator is active for tracking" },
+        "handle": { "type": "string", "description": "Channel @handle or custom username" },
+        "avatarUrl": { "type": "string", "description": "Profile avatar image URL" },
+        "addedDate": { "type": "string", "description": "ISO timestamp when creator was added" },
+        "lastUpdated": { "type": "string", "description": "ISO timestamp of last crawl update" }
+      },
+      "required": ["id", "name", "enabled"]
+    },
+    "Short": {
+      "title": "Short",
+      "description": "YouTube Short video metadata and associated viral audio information",
+      "type": "object",
+      "properties": {
+        "videoId": { "type": "string", "description": "YouTube 11-char Video ID" },
+        "title": { "type": "string", "description": "Short title" },
+        "thumbnailUrl": { "type": "string", "description": "Vertical video thumbnail URL" },
+        "views": { "type": "number", "description": "View count" },
+        "likes": { "type": "number", "description": "Like count" },
+        "publishedDate": { "type": "string", "description": "ISO publication date" },
+        "creatorName": { "type": "string", "description": "Creator display name" },
+        "creatorId": { "type": "string", "description": "Creator channel ID" },
+        "videoUrl": { "type": "string", "description": "Direct YouTube Short link" },
+        "audioName": { "type": "string", "description": "Name and attribution of the background audio track" },
+        "audioId": { "type": "string", "description": "Foreign key to the Audio collection" },
+        "description": { "type": "string", "description": "Video description text" }
+      },
+      "required": ["videoId", "title", "creatorId", "views"]
+    },
+    "Audio": {
+      "title": "Audio",
+      "description": "Aggregated audio / song group identified across creator Shorts",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique stable audio identifier (e.g. audio_...)" },
+        "name": { "type": "string", "description": "Song / sound track name" },
+        "artist": { "type": "string", "description": "Artist or performer name" },
+        "uniqueCreatorsCount": { "type": "number", "description": "Count of distinct creators using this audio" },
+        "shortsCount": { "type": "number", "description": "Total Shorts using this audio" },
+        "totalViews": { "type": "number", "description": "Aggregate views across all Shorts" },
+        "latestUploadDate": { "type": "string", "description": "ISO date of the most recent Short with this audio" },
+        "trendScore": { "type": "number", "description": "Calculated virality / trend score" },
+        "highestViewedShortId": { "type": "string", "description": "YouTube Video ID of the top-performing Short" },
+        "thumbnailUrl": { "type": "string", "description": "Thumbnail preview" }
+      },
+      "required": ["id", "name", "trendScore"]
+    },
+    "AudioUsage": {
+      "title": "AudioUsage",
+      "description": "Cross-reference link recording usage of an audio in a specific video by a creator",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique usage identifier videoId_audioId" },
+        "audioId": { "type": "string", "description": "Identifier of the audio group" },
+        "videoId": { "type": "string", "description": "YouTube Video ID" },
+        "creatorId": { "type": "string", "description": "Creator Channel ID" },
+        "views": { "type": "number", "description": "Views for this usage" },
+        "publishedDate": { "type": "string", "description": "ISO publication date" }
+      },
+      "required": ["id", "audioId", "videoId", "creatorId"]
+    },
+    "SyncLog": {
+      "title": "SyncLog",
+      "description": "Execution and audit log of YouTube data sync operations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique UUID for the sync run" },
+        "startTime": { "type": "string", "description": "ISO start timestamp" },
+        "endTime": { "type": "string", "description": "ISO completion timestamp" },
+        "status": { "type": "string", "description": "Job status: success, failed, or running" },
+        "durationSec": { "type": "number", "description": "Run duration in seconds" },
+        "creatorsProcessed": { "type": "number", "description": "Count of creators processed" },
+        "videosProcessed": { "type": "number", "description": "Count of videos analyzed" },
+        "trendingAudiosFound": { "type": "number", "description": "Count of viral audios discovered" },
+        "videosRetrieved": { "type": "number", "description": "New videos pulled" }
+      },
+      "required": ["id", "startTime", "status"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Application settings and crawl preferences",
+      "type": "object",
+      "properties": {
+        "creatorLimit": { "type": "number", "description": "Max creators to process in batch" },
+        "periodDays": { "type": "number", "description": "Analysis timeframe in days (7, 14, 21, 30)" },
+        "youtubeApiKeyPrimary": { "type": "string", "description": "Optional primary YouTube API key override" },
+        "youtubeApiKeyBackup": { "type": "string", "description": "Optional backup YouTube API key override" }
+      },
+      "required": ["creatorLimit", "periodDays"]
+    }
+  },
+  "firestore": {
+    "/creators/{creatorId}": {
+      "schema": "Creator",
+      "description": "Tracked YouTube creators"
+    },
+    "/shorts/{videoId}": {
+      "schema": "Short",
+      "description": "Fetched and analyzed YouTube Shorts"
+    },
+    "/audios/{audioId}": {
+      "schema": "Audio",
+      "description": "Viral audio groups and aggregated trend metrics"
+    },
+    "/audio_usage/{usageId}": {
+      "schema": "AudioUsage",
+      "description": "Cross-reference link mapping audio usage per video and creator"
+    },
+    "/sync_logs/{logId}": {
+      "schema": "SyncLog",
+      "description": "Sync execution and audit history"
+    },
+    "/settings/{settingId}": {
+      "schema": "Settings",
+      "description": "Global application configuration"
+    }
+  }
+}

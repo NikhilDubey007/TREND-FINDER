@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connectivity test probe
+    match /test/{docId} {
+      allow read, write: if true;
+    }
+
+    // Creators collection: Managed by backend
+    match /creators/{creatorId} {
+      allow read, write: if true;
+    }
+
+    // Shorts collection: YouTube Shorts repository with stable videoId
+    match /shorts/{videoId} {
+      allow read, write: if true;
+    }
+
+    // Audios collection: Discovered viral music & sound groups
+    match /audios/{audioId} {
+      allow read, write: if true;
+    }
+
+    // Audio Usage collection: Association between audio, short, and creator
+    match /audio_usage/{usageId} {
+      allow read, write: if true;
+    }
+
+    // Sync Logs collection: Crawl & sync history
+    match /sync_logs/{logId} {
+      allow read, write: if true;
+    }
+
+    // Settings collection: Global app configurations
+    match /settings/{settingId} {
+      allow read, write: if true;
+    }
+  }
+}

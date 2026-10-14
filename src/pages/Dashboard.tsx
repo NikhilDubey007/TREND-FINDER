@@ -98,6 +98,21 @@ export default function Dashboard({ triggerNotification }: { triggerNotification
     }
   };
 
+  const [resettingJob, setResettingJob] = useState(false);
+  const handleResetStuckJob = async () => {
+    setResettingJob(true);
+    try {
+      await axios.post("/api/refresh/reset");
+      triggerNotification("Trend Analysis Engine reset to IDLE.", "success");
+      setRefreshing(false);
+      fetchDashboardData(true, timeframe);
+    } catch (e: any) {
+      triggerNotification(e.response?.data?.error || "Failed to reset engine.", "error");
+    } finally {
+      setResettingJob(false);
+    }
+  };
+
   // User-specific timeframe update: updates localStorage immediately without modifying global Firestore settings
   const handleUpdatePeriod = (newDays: number) => {
     try {
@@ -213,11 +228,21 @@ export default function Dashboard({ triggerNotification }: { triggerNotification
               </div>
             </div>
             
-            <div className="w-full md:w-48 bg-zinc-800 rounded-full h-2">
-              <div 
-                className="bg-gradient-to-r from-purple-500 to-indigo-500 h-2 rounded-full transition-all duration-300"
-                style={{ width: `${activeJob.progress}%` }}
-              ></div>
+            <div className="flex items-center gap-3">
+              <div className="w-full md:w-48 bg-zinc-800 rounded-full h-2">
+                <div 
+                  className="bg-gradient-to-r from-purple-500 to-indigo-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${activeJob.progress}%` }}
+                ></div>
+              </div>
+              <button
+                onClick={handleResetStuckJob}
+                disabled={resettingJob}
+                title="Reset stuck engine"
+                className="text-[10px] text-zinc-400 hover:text-white px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 rounded-md font-mono shrink-0 cursor-pointer border border-zinc-700/60 transition"
+              >
+                {resettingJob ? "..." : "Reset"}
+              </button>
             </div>
           </div>
         </motion.div>

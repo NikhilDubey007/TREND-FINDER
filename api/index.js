@@ -117,6 +117,36 @@ function isFirestoreAvailable() {
   }
   return isReachable && firestoreInstance !== null;
 }
+async function isFirestoreEmpty() {
+  const db = initFirestore();
+  if (!db) return false;
+  try {
+    const [creatorsSnap, shortsSnap] = await Promise.all([
+      getDocs(query(collection(db, "creators"), firestoreLimit(1))),
+      getDocs(query(collection(db, "shorts"), firestoreLimit(1)))
+    ]);
+    return creatorsSnap.empty && shortsSnap.empty;
+  } catch (err) {
+    console.error("[Firestore] Error checking if database is empty:", err);
+    return false;
+  }
+}
+async function testFirestoreConnection() {
+  const db = initFirestore();
+  if (!db) return false;
+  try {
+    const testDoc = doc(db, "test", "connection");
+    await setDoc(testDoc, { timestamp: (/* @__PURE__ */ new Date()).toISOString(), ok: true }, { merge: true });
+    return true;
+  } catch (err) {
+    try {
+      const snap = await getDocs(query(collection(db, "creators"), firestoreLimit(1)));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
 async function fetchCreatorsFromFirestore() {
   const db = initFirestore();
   if (!db) return null;
@@ -155,11 +185,16 @@ async function deleteCreatorFromFirestore(creatorId) {
     const q = query(shortsRef, where("creatorId", "==", creatorId));
     const snap = await getDocs(q);
     if (!snap.empty) {
-      const batch = writeBatch(db);
-      snap.forEach((sDoc) => {
-        batch.delete(sDoc.ref);
-      });
-      await batch.commit();
+      const docs = snap.docs;
+      const CHUNK_SIZE = 200;
+      for (let i = 0; i < docs.length; i += CHUNK_SIZE) {
+        const chunk = docs.slice(i, i + CHUNK_SIZE);
+        const batch = writeBatch(db);
+        chunk.forEach((sDoc) => {
+          batch.delete(sDoc.ref);
+        });
+        await batch.commit();
+      }
     }
     return true;
   } catch (err) {
@@ -191,9 +226,10 @@ async function fetchRawShortsFromFirestore(cutoffDate) {
 }
 async function upsertShortsInFirestore(shorts) {
   const db = initFirestore();
-  if (!db || shorts.length === 0) return false;
+  if (!db || shorts.length === 0) return { success: true, count: 0 };
   try {
-    const CHUNK_SIZE = 400;
+    const CHUNK_SIZE = 200;
+    let totalWritten = 0;
     for (let i = 0; i < shorts.length; i += CHUNK_SIZE) {
       const chunk = shorts.slice(i, i + CHUNK_SIZE);
       const batch = writeBatch(db);
@@ -201,40 +237,29 @@ async function upsertShortsInFirestore(shorts) {
         if (!s.videoId) continue;
         const sRef = doc(db, "shorts", s.videoId);
         batch.set(sRef, sanitizeForFirestore(s), { merge: true });
+        if (s.audioId) {
+          const usageId = `${s.videoId}_${s.audioId}`;
+          const usageRef = doc(db, "audio_usage", usageId);
+          const usageRecord = {
+            id: usageId,
+            audioId: s.audioId,
+            videoId: s.videoId,
+            creatorId: s.creatorId,
+            views: s.views,
+            publishedDate: s.publishedDate
+          };
+          batch.set(usageRef, sanitizeForFirestore(usageRecord), { merge: true });
+        }
       }
       await batch.commit();
+      totalWritten += chunk.length;
     }
-    return true;
+    return { success: true, count: totalWritten };
   } catch (err) {
-    console.warn("[Firestore] Failed to upsert shorts batch (quota or network):", err);
-    return false;
-  }
-}
-async function fetchTrendsCacheFromFirestore() {
-  const db = initFirestore();
-  if (!db) return null;
-  try {
-    const docRef = doc(db, "settings", "trends_cache");
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      return snap.data();
-    }
-    return null;
-  } catch (err) {
-    console.warn("[Firestore] Failed to fetch trends cache:", err);
-    return null;
-  }
-}
-async function saveTrendsCacheToFirestore(trendsCache) {
-  const db = initFirestore();
-  if (!db) return false;
-  try {
-    const docRef = doc(db, "settings", "trends_cache");
-    await setDoc(docRef, sanitizeForFirestore(trendsCache), { merge: true });
-    return true;
-  } catch (err) {
-    console.warn("[Firestore] Failed to save trends cache:", err);
-    return false;
+    const errorCode = err?.code || "UNKNOWN";
+    const errorMsg = err?.message || String(err);
+    console.error(`[Firestore] Failed to upsert shorts batch (${errorCode}):`, errorMsg);
+    return { success: false, count: 0, error: errorMsg, code: errorCode };
   }
 }
 async function fetchAudiosFromFirestore() {
@@ -255,9 +280,10 @@ async function fetchAudiosFromFirestore() {
 }
 async function upsertAudiosInFirestore(audios) {
   const db = initFirestore();
-  if (!db || audios.length === 0) return false;
+  if (!db || audios.length === 0) return { success: true, count: 0 };
   try {
-    const CHUNK_SIZE = 400;
+    const CHUNK_SIZE = 200;
+    let totalWritten = 0;
     for (let i = 0; i < audios.length; i += CHUNK_SIZE) {
       const chunk = audios.slice(i, i + CHUNK_SIZE);
       const batch = writeBatch(db);
@@ -267,11 +293,14 @@ async function upsertAudiosInFirestore(audios) {
         batch.set(aRef, sanitizeForFirestore(a), { merge: true });
       }
       await batch.commit();
+      totalWritten += chunk.length;
     }
-    return true;
+    return { success: true, count: totalWritten };
   } catch (err) {
-    console.error("[Firestore] Failed to upsert audios batch:", err);
-    return false;
+    const errorCode = err?.code || "UNKNOWN";
+    const errorMsg = err?.message || String(err);
+    console.error(`[Firestore] Failed to upsert audios batch (${errorCode}):`, errorMsg);
+    return { success: false, count: 0, error: errorMsg, code: errorCode };
   }
 }
 async function fetchSettingsFromFirestore() {
@@ -306,13 +335,20 @@ async function fetchSyncLogsFromFirestore(maxResults = 50) {
   if (!db) return null;
   try {
     const colRef = collection(db, "sync_logs");
-    const q = query(colRef, orderBy("startTime", "desc"), firestoreLimit(maxResults));
-    const snap = await getDocs(q);
+    let snap;
+    try {
+      const q = query(colRef, orderBy("startTime", "desc"), firestoreLimit(maxResults));
+      snap = await getDocs(q);
+    } catch (qErr) {
+      console.warn("[Firestore] Query sync_logs with orderBy failed, fetching all and sorting in-memory:", qErr);
+      snap = await getDocs(colRef);
+    }
     const logs = [];
     snap.forEach((docSnap) => {
       logs.push(docSnap.data());
     });
-    return logs;
+    logs.sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime());
+    return logs.slice(0, maxResults);
   } catch (err) {
     console.error("[Firestore] Failed to fetch sync logs:", err);
     return null;
@@ -320,14 +356,16 @@ async function fetchSyncLogsFromFirestore(maxResults = 50) {
 }
 async function appendSyncLogInFirestore(log) {
   const db = initFirestore();
-  if (!db || !log.id) return false;
+  if (!db || !log.id) return { success: false, error: "Database not initialized or log missing ID" };
   try {
     const docRef = doc(db, "sync_logs", log.id);
     await setDoc(docRef, sanitizeForFirestore(log), { merge: true });
-    return true;
+    return { success: true };
   } catch (err) {
-    console.error("[Firestore] Failed to save sync log:", err);
-    return false;
+    const errorCode = err?.code || "UNKNOWN";
+    const errorMsg = err?.message || String(err);
+    console.error(`[Firestore] Failed to save sync log (${errorCode}):`, errorMsg);
+    return { success: false, error: errorMsg, code: errorCode };
   }
 }
 async function fetchRefreshStatusFromFirestore() {
@@ -355,82 +393,6 @@ async function saveRefreshStatusToFirestore(status) {
   } catch (err) {
     console.error("[Firestore] Failed to save refresh status:", err);
     return false;
-  }
-}
-async function migrateLocalDataToFirestore(localDb) {
-  const db = initFirestore();
-  if (!db) {
-    return {
-      success: false,
-      migratedCreators: 0,
-      migratedShorts: 0,
-      migratedAudios: 0,
-      migratedLogs: 0,
-      error: "Firestore not initialized"
-    };
-  }
-  try {
-    console.log("[Firestore Migration] Starting idempotent migration of local database records to Firestore...");
-    const existingCreators = await fetchCreatorsFromFirestore();
-    let migratedCreators = 0;
-    if (localDb.creators && localDb.creators.length > 0) {
-      const existingIds = new Set((existingCreators || []).map((c) => c.id));
-      for (const creator of localDb.creators) {
-        if (creator.id && !existingIds.has(creator.id)) {
-          await upsertCreatorInFirestore(creator);
-          migratedCreators++;
-        }
-      }
-    }
-    const existingShorts = await fetchRawShortsFromFirestore();
-    let migratedShorts = 0;
-    const allShorts = localDb.rawShorts || localDb.shorts || [];
-    if ((!existingShorts || existingShorts.length === 0) && allShorts.length > 0) {
-      await upsertShortsInFirestore(allShorts);
-      migratedShorts = allShorts.length;
-    } else {
-      console.log(`[Firestore Migration] Preserving cloud shorts: Firestore already has ${existingShorts?.length || 0} shorts.`);
-    }
-    const existingAudios = await fetchAudiosFromFirestore();
-    let migratedAudios = 0;
-    if ((!existingAudios || existingAudios.length === 0) && localDb.audios && localDb.audios.length > 0) {
-      await upsertAudiosInFirestore(localDb.audios);
-      migratedAudios = localDb.audios.length;
-    } else {
-      console.log(`[Firestore Migration] Preserving cloud audios: Firestore already has ${existingAudios?.length || 0} audios.`);
-    }
-    if (localDb.settings) {
-      await upsertSettingsInFirestore(localDb.settings);
-    }
-    let migratedLogs = 0;
-    if (localDb.fetchHistory && localDb.fetchHistory.length > 0) {
-      for (const log of localDb.fetchHistory) {
-        if (log.id) {
-          await appendSyncLogInFirestore(log);
-          migratedLogs++;
-        }
-      }
-    }
-    console.log(
-      `[Firestore Migration] Completed successfully: ${migratedCreators} creators, ${migratedShorts} shorts, ${migratedAudios} audios, ${migratedLogs} logs migrated.`
-    );
-    return {
-      success: true,
-      migratedCreators,
-      migratedShorts,
-      migratedAudios,
-      migratedLogs
-    };
-  } catch (err) {
-    console.error("[Firestore Migration] Encountered error during migration:", err);
-    return {
-      success: false,
-      migratedCreators: 0,
-      migratedShorts: 0,
-      migratedAudios: 0,
-      migratedLogs: 0,
-      error: err?.message || String(err)
-    };
   }
 }
 
@@ -1121,16 +1083,20 @@ function runTrendAnalysis(shorts, creators) {
 }
 function getPreloadedShortsForCreators(creatorsToFetch, periodDays) {
   let preloadedShorts = [];
-  try {
-    if (fs2.existsSync(DB_PATH)) {
-      const defaultData = fs2.readFileSync(DB_PATH, "utf-8");
-      const parsed = JSON.parse(defaultData);
-      if (parsed && Array.isArray(parsed.shorts)) {
-        preloadedShorts = parsed.shorts;
+  if (memoryDb && memoryDb.rawShorts && memoryDb.rawShorts.length > 0) {
+    preloadedShorts = memoryDb.rawShorts;
+  } else {
+    try {
+      if (fs2.existsSync(DB_PATH)) {
+        const defaultData = fs2.readFileSync(DB_PATH, "utf-8");
+        const parsed = JSON.parse(defaultData);
+        if (parsed && Array.isArray(parsed.shorts)) {
+          preloadedShorts = parsed.shorts;
+        }
       }
+    } catch (e) {
+      console.error("Error reading default database template:", e);
     }
-  } catch (e) {
-    console.error("Error reading default database template:", e);
   }
   const now = /* @__PURE__ */ new Date();
   let shiftedShorts = [];
@@ -1173,63 +1139,117 @@ function getDbPath(deviceIdInput) {
   return DB_PATH;
 }
 var memoryDb = null;
-function loadDb(deviceIdInput) {
-  if (memoryDb) {
+var hydrationPromise = null;
+var lastHydratedAt = 0;
+var HYDRATION_TTL_MS = 60 * 1e3;
+async function ensureFirestoreHydrated(forceRefresh = false) {
+  if (memoryDb && !forceRefresh && Date.now() - lastHydratedAt < HYDRATION_TTL_MS) {
     return memoryDb;
   }
-  try {
-    if (fs2.existsSync(DB_PATH)) {
-      const data = fs2.readFileSync(DB_PATH, "utf-8");
-      const parsed = JSON.parse(data);
-      if (parsed) {
-        if (!parsed.creators) {
-          parsed.creators = [];
-        }
-        if (!parsed.settings) {
-          parsed.settings = { ...defaultSettings };
-        }
-        if (parsed.settings.creatorLimit === void 0) {
-          parsed.settings.creatorLimit = 9999;
-        }
-        if (parsed.settings.periodDays === void 0) {
-          parsed.settings.periodDays = 7;
-        }
-        if (!parsed.rawShorts) {
-          parsed.rawShorts = parsed.shorts || [];
-        }
-        const periodDays = parsed.settings.periodDays || 7;
-        const periods2 = [7, 14, 21, 30];
-        const trendsCache = {};
-        const nowTime = Date.now();
-        periods2.forEach((pDays) => {
-          const cutoffTime = nowTime - pDays * 24 * 60 * 60 * 1e3;
-          const filteredRawShorts = (parsed.rawShorts || []).filter((s) => {
-            if (!s.publishedDate) return false;
-            return new Date(s.publishedDate).getTime() >= cutoffTime;
-          });
-          const analysisResult = runTrendAnalysis(filteredRawShorts, parsed.creators);
-          trendsCache[pDays] = {
-            shorts: analysisResult.shorts,
-            audios: analysisResult.audios
-          };
-        });
-        parsed.trendsCache = trendsCache;
-        const activeTrend2 = trendsCache[periodDays] || trendsCache[7];
-        if (activeTrend2) {
-          parsed.shorts = activeTrend2.shorts;
-          parsed.audios = activeTrend2.audios;
-        }
-        memoryDb = parsed;
-        return parsed;
-      }
-    }
-  } catch (error) {
-    console.error(`Database read error for global path ${DB_PATH}:`, error);
+  if (hydrationPromise) {
+    return hydrationPromise;
   }
-  console.log("Bootstrapping database with multi-timeframe cached data...");
+  hydrationPromise = (async () => {
+    try {
+      if (!isFirestoreAvailable()) {
+        initFirestore();
+      }
+      if (isFirestoreAvailable()) {
+        const [remoteCreators, remoteShorts, remoteAudios, remoteSettings, remoteLogs, remoteRefresh] = await Promise.all([
+          fetchCreatorsFromFirestore(),
+          fetchRawShortsFromFirestore(),
+          fetchAudiosFromFirestore(),
+          fetchSettingsFromFirestore(),
+          fetchSyncLogsFromFirestore(50),
+          fetchRefreshStatusFromFirestore()
+        ]);
+        const hasFirestoreData = remoteCreators && remoteCreators.length > 0 || remoteShorts && remoteShorts.length > 0;
+        if (hasFirestoreData) {
+          const creators = remoteCreators || [];
+          const rawShorts = remoteShorts || [];
+          const settings = remoteSettings ? { ...defaultSettings, ...remoteSettings } : memoryDb?.settings || defaultSettings;
+          const fetchHistory = remoteLogs || [];
+          const refreshStatus = remoteRefresh || memoryDb?.refreshStatus || {
+            status: "idle",
+            lastRun: (/* @__PURE__ */ new Date()).toISOString(),
+            logs: ["Runtime hydrated from Firestore."],
+            progress: 100
+          };
+          if (refreshStatus.status === "running") {
+            const lastRunTime = refreshStatus.lastRun ? new Date(refreshStatus.lastRun).getTime() : 0;
+            const isStale = !lastRunTime || Date.now() - lastRunTime > 10 * 60 * 1e3;
+            if (isStale) {
+              console.warn("[Persistence] Detected stale running engine job (>10m old). Automatically resetting status to idle.");
+              refreshStatus.status = "idle";
+              refreshStatus.progress = 100;
+              refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Engine automatically reset to idle (previous job timed out).`);
+              saveRefreshStatusToFirestore(refreshStatus).catch((e) => console.warn("[Firestore] Reset status error:", e));
+            }
+          }
+          const periods = [7, 14, 21, 30];
+          const trendsCache = {};
+          const now = /* @__PURE__ */ new Date();
+          periods.forEach((pDays) => {
+            const cutoffTime = now.getTime() - pDays * 24 * 60 * 60 * 1e3;
+            const filteredShorts = rawShorts.filter((s) => s.publishedDate && new Date(s.publishedDate).getTime() >= cutoffTime);
+            const analysisResult = runTrendAnalysis(filteredShorts, creators);
+            trendsCache[pDays] = {
+              shorts: analysisResult.shorts,
+              audios: analysisResult.audios
+            };
+          });
+          const activeDays = settings.periodDays || 7;
+          const activeTrend = trendsCache[activeDays] || trendsCache[7] || { shorts: [], audios: [] };
+          const hydratedDb = {
+            creators,
+            rawShorts,
+            shorts: activeTrend.shorts,
+            audios: activeTrend.audios,
+            settings,
+            refreshStatus,
+            apiLogs: memoryDb?.apiLogs || [],
+            fetchHistory,
+            trendsCache
+          };
+          memoryDb = hydratedDb;
+          lastHydratedAt = Date.now();
+          console.log(
+            `[Firestore] Hydrated runtime cache directly from Firestore: ${creators.length} creators, ${rawShorts.length} raw shorts, ${activeTrend.audios.length} audios, ${fetchHistory.length} sync logs.`
+          );
+          if (!process.env.VERCEL) {
+            try {
+              fs2.writeFileSync(DB_PATH, JSON.stringify(hydratedDb, null, 2), "utf-8");
+            } catch (e) {
+              console.warn("[Persistence] Local file mirror update skipped:", e);
+            }
+          }
+          return hydratedDb;
+        } else {
+          const empty = await isFirestoreEmpty();
+          if (empty) {
+            console.warn("[Persistence] Firestore is completely empty. Performing initial bootstrap setup...");
+            return await seedInitialDatabaseToFirestore();
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Persistence] Error during Firestore cache hydration:", err);
+    }
+    if (memoryDb) {
+      return memoryDb;
+    }
+    console.warn("[Persistence] Firestore unavailable. Falling back to local read-only cache.");
+    return loadFallbackLocalDb();
+  })().finally(() => {
+    hydrationPromise = null;
+  });
+  return hydrationPromise;
+}
+async function seedInitialDatabaseToFirestore() {
+  console.log("[Persistence] Bootstrapping initial database and seeding to Firestore (one-time initialization)...");
   const mockShorts = generateMockShorts(defaultCreators, 30);
-  const initialTrendsCache = {};
   const periods = [7, 14, 21, 30];
+  const initialTrendsCache = {};
   const bootNow = /* @__PURE__ */ new Date();
   periods.forEach((pDays) => {
     const cutoffTime = bootNow.getTime() - pDays * 24 * 60 * 60 * 1e3;
@@ -1240,14 +1260,29 @@ function loadDb(deviceIdInput) {
       audios: analysisResult.audios
     };
   });
-  const activeDays = defaultSettings.periodDays;
+  const activeDays = defaultSettings.periodDays || 7;
   const activeTrend = initialTrendsCache[activeDays] || initialTrendsCache[7];
-  const initialDb = {
-    creators: defaultCreators.map((c) => ({
-      ...c,
-      addedDate: (/* @__PURE__ */ new Date()).toISOString(),
-      lastUpdated: (/* @__PURE__ */ new Date()).toISOString()
-    })),
+  const seedCreators = defaultCreators.map((c) => ({
+    ...c,
+    addedDate: (/* @__PURE__ */ new Date()).toISOString(),
+    lastUpdated: (/* @__PURE__ */ new Date()).toISOString()
+  }));
+  const initialLog = {
+    id: crypto.randomUUID(),
+    startTime: (/* @__PURE__ */ new Date()).toISOString(),
+    endTime: (/* @__PURE__ */ new Date()).toISOString(),
+    status: "success",
+    persistenceStatus: "FETCH_SUCCESS_PERSISTED",
+    firestorePersisted: true,
+    durationSec: 1,
+    creatorsProcessed: defaultCreators.length,
+    videosProcessed: mockShorts.length,
+    trendingAudiosFound: activeTrend.audios.length,
+    errors: [],
+    failedCreators: []
+  };
+  const seedDb = {
+    creators: seedCreators,
     rawShorts: mockShorts,
     shorts: activeTrend.shorts,
     audios: activeTrend.audios,
@@ -1255,37 +1290,82 @@ function loadDb(deviceIdInput) {
     refreshStatus: {
       status: "idle",
       lastRun: (/* @__PURE__ */ new Date()).toISOString(),
-      logs: ["Database bootstrapped with high-fidelity multi-timeframe mock data."],
+      logs: ["Database bootstrapped with initial data."],
       progress: 100
     },
     apiLogs: [
       { timestamp: (/* @__PURE__ */ new Date()).toISOString(), method: "SYSTEM", url: "BOOTSTRAP", status: 200, durationMs: 150 }
     ],
-    fetchHistory: [
-      {
-        id: crypto.randomUUID(),
-        startTime: (/* @__PURE__ */ new Date()).toISOString(),
-        endTime: (/* @__PURE__ */ new Date()).toISOString(),
-        status: "success",
-        durationSec: 1,
-        creatorsProcessed: defaultCreators.length,
-        videosProcessed: mockShorts.length,
-        trendingAudiosFound: activeTrend.audios.length,
-        errors: [],
-        failedCreators: []
-      }
-    ],
+    fetchHistory: [initialLog],
     trendsCache: initialTrendsCache
   };
-  memoryDb = initialDb;
-  if (!process.env.VERCEL) {
-    try {
-      fs2.writeFileSync(DB_PATH, JSON.stringify(initialDb, null, 2), "utf-8");
-    } catch (error) {
-      console.error(`Error saving bootstrapped database file:`, error);
+  try {
+    for (const c of seedCreators) {
+      await upsertCreatorInFirestore(c);
     }
+    await upsertShortsInFirestore(mockShorts);
+    await upsertAudiosInFirestore(activeTrend.audios);
+    await upsertSettingsInFirestore(defaultSettings);
+    await appendSyncLogInFirestore(initialLog);
+    await saveRefreshStatusToFirestore(seedDb.refreshStatus);
+    console.log("[Persistence] Seed data successfully written to Firestore.");
+  } catch (seedErr) {
+    console.error("[Persistence] Failed to seed initial data to Firestore:", seedErr);
   }
+  memoryDb = seedDb;
+  lastHydratedAt = Date.now();
+  return seedDb;
+}
+function loadFallbackLocalDb() {
+  try {
+    if (fs2.existsSync(DB_PATH)) {
+      const data = fs2.readFileSync(DB_PATH, "utf-8");
+      const parsed = JSON.parse(data);
+      if (parsed) {
+        if (!parsed.creators) parsed.creators = [];
+        if (!parsed.settings) parsed.settings = { ...defaultSettings };
+        if (!parsed.rawShorts) parsed.rawShorts = parsed.shorts || [];
+        const periodDays = parsed.settings.periodDays || 7;
+        const cutoffTime = Date.now() - periodDays * 24 * 60 * 60 * 1e3;
+        const filteredRawShorts = (parsed.rawShorts || []).filter((s) => s.publishedDate && new Date(s.publishedDate).getTime() >= cutoffTime);
+        const analysisResult = runTrendAnalysis(filteredRawShorts, parsed.creators);
+        parsed.shorts = analysisResult.shorts;
+        parsed.audios = analysisResult.audios;
+        memoryDb = parsed;
+        return parsed;
+      }
+    }
+  } catch (error) {
+    console.error("[Persistence Fallback] Database read error for local DB:", error);
+  }
+  const initialDb = {
+    creators: defaultCreators.map((c) => ({
+      ...c,
+      addedDate: (/* @__PURE__ */ new Date()).toISOString(),
+      lastUpdated: (/* @__PURE__ */ new Date()).toISOString()
+    })),
+    rawShorts: [],
+    shorts: [],
+    audios: [],
+    settings: defaultSettings,
+    refreshStatus: {
+      status: "idle",
+      lastRun: (/* @__PURE__ */ new Date()).toISOString(),
+      logs: ["Database runtime initialized."],
+      progress: 100
+    },
+    apiLogs: [],
+    fetchHistory: [],
+    trendsCache: {}
+  };
+  memoryDb = initialDb;
   return initialDb;
+}
+function loadDb(deviceIdInput) {
+  if (memoryDb) {
+    return memoryDb;
+  }
+  return loadFallbackLocalDb();
 }
 function saveDb(data, deviceIdInput) {
   memoryDb = data;
@@ -1296,112 +1376,11 @@ function saveDb(data, deviceIdInput) {
     console.error(`Error saving database file to ${DB_PATH}:`, error);
   }
 }
-var hasHydratedFromFirestore = false;
-var lastFirestoreSyncTimestamp = 0;
-var FIRESTORE_SYNC_CACHE_MS = 2e4;
-async function syncFromFirestore(force = false) {
-  if (!isFirestoreAvailable()) return false;
-  const now = Date.now();
-  if (!force && hasHydratedFromFirestore && now - lastFirestoreSyncTimestamp < FIRESTORE_SYNC_CACHE_MS) {
-    return true;
-  }
+app.use("/api", async (req, res, next) => {
   try {
-    const [remoteCreators, remoteShorts, remoteAudios, remoteSettings, remoteLogs, remoteRefresh, remoteTrendsCache] = await Promise.all([
-      fetchCreatorsFromFirestore(),
-      fetchRawShortsFromFirestore(),
-      fetchAudiosFromFirestore(),
-      fetchSettingsFromFirestore(),
-      fetchSyncLogsFromFirestore(),
-      fetchRefreshStatusFromFirestore(),
-      fetchTrendsCacheFromFirestore()
-    ]);
-    const currentDb = loadDb();
-    let hasChanges = false;
-    if (remoteCreators && remoteCreators.length > 0) {
-      currentDb.creators = remoteCreators;
-      hasChanges = true;
-    }
-    if (remoteShorts && remoteShorts.length > 0) {
-      currentDb.rawShorts = remoteShorts;
-      hasChanges = true;
-    }
-    if (remoteAudios && remoteAudios.length > 0) {
-      currentDb.audios = remoteAudios;
-      hasChanges = true;
-    }
-    if (remoteSettings) {
-      currentDb.settings = { ...currentDb.settings, ...remoteSettings };
-      hasChanges = true;
-    }
-    if (remoteLogs && remoteLogs.length > 0) {
-      currentDb.fetchHistory = remoteLogs;
-      hasChanges = true;
-    }
-    if (remoteRefresh) {
-      currentDb.refreshStatus = remoteRefresh;
-      hasChanges = true;
-    }
-    if (remoteTrendsCache && Object.keys(remoteTrendsCache).length > 0) {
-      currentDb.trendsCache = remoteTrendsCache;
-      const activeDays = currentDb.settings?.periodDays || 7;
-      const activeTrend = remoteTrendsCache[activeDays] || remoteTrendsCache[7];
-      if (activeTrend) {
-        currentDb.shorts = activeTrend.shorts;
-        currentDb.audios = activeTrend.audios;
-      }
-      hasChanges = true;
-    }
-    if (hasChanges || !currentDb.trendsCache || Object.keys(currentDb.trendsCache).length === 0) {
-      const periods = [7, 14, 21, 30];
-      const trendsCache = {};
-      const bootNow = /* @__PURE__ */ new Date();
-      periods.forEach((pDays) => {
-        const cutoffTime = bootNow.getTime() - pDays * 24 * 60 * 60 * 1e3;
-        const filteredRawShorts = (currentDb.rawShorts || []).filter((s) => {
-          if (!s.publishedDate) return false;
-          return new Date(s.publishedDate).getTime() >= cutoffTime;
-        });
-        const analysisResult = runTrendAnalysis(filteredRawShorts, currentDb.creators);
-        trendsCache[pDays] = {
-          shorts: analysisResult.shorts,
-          audios: analysisResult.audios
-        };
-      });
-      currentDb.trendsCache = trendsCache;
-      const activeDays = currentDb.settings?.periodDays || 7;
-      const activeTrend = trendsCache[activeDays] || trendsCache[7];
-      if (activeTrend) {
-        currentDb.shorts = activeTrend.shorts;
-        currentDb.audios = activeTrend.audios;
-      }
-      memoryDb = currentDb;
-      saveTrendsCacheToFirestore(trendsCache).catch((err) => console.warn("[Firestore] Failed to persist trends cache:", err));
-      if (!process.env.VERCEL) {
-        try {
-          fs2.writeFileSync(DB_PATH, JSON.stringify(currentDb, null, 2), "utf-8");
-        } catch (e) {
-          console.error("[Firestore Sync] Error saving synchronized database:", e);
-        }
-      }
-      console.log(`[Firestore Sync] Database synchronized from Firestore (${currentDb.creators.length} creators, ${currentDb.rawShorts?.length || 0} shorts, ${currentDb.audios?.length || 0} audios).`);
-    }
-    hasHydratedFromFirestore = true;
-    lastFirestoreSyncTimestamp = Date.now();
-    return true;
+    await ensureFirestoreHydrated();
   } catch (err) {
-    console.warn("[Firestore Sync] Error during background synchronization with Firestore:", err);
-    return false;
-  }
-}
-app.use(async (req, res, next) => {
-  if (req.url.startsWith("/api/")) {
-    if (isFirestoreAvailable()) {
-      if (!hasHydratedFromFirestore || !memoryDb) {
-        await syncFromFirestore(true);
-      } else if (Date.now() - lastFirestoreSyncTimestamp > FIRESTORE_SYNC_CACHE_MS) {
-        syncFromFirestore(false).catch((err) => console.warn("[Firestore Sync] Background refresh error:", err));
-      }
-    }
+    console.error("[Persistence Middleware] Hydration error:", err);
   }
   next();
 });
@@ -1421,8 +1400,7 @@ app.use((req, res, next) => {
         status: res.statusCode,
         durationMs: duration
       };
-      db.apiLogs = [logEntry, ...db.apiLogs].slice(0, 100);
-      saveDb(db, req);
+      db.apiLogs = [logEntry, ...db.apiLogs || []].slice(0, 100);
     } catch (e) {
       console.error("Failed to write API Log:", e);
     }
@@ -1432,7 +1410,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 function getTimeframeData(db, requestedPeriodDays) {
   const periodDays = requestedPeriodDays && !isNaN(requestedPeriodDays) && requestedPeriodDays > 0 ? Number(requestedPeriodDays) : db.settings.periodDays || 7;
-  if (db.trendsCache && db.trendsCache[periodDays] && Array.isArray(db.trendsCache[periodDays].shorts)) {
+  if (db.trendsCache && db.trendsCache[periodDays]) {
     return {
       shorts: db.trendsCache[periodDays].shorts,
       audios: db.trendsCache[periodDays].audios,
@@ -1443,11 +1421,6 @@ function getTimeframeData(db, requestedPeriodDays) {
   const rawList = db.rawShorts || db.shorts || [];
   const filtered = rawList.filter((s) => s.publishedDate && new Date(s.publishedDate).getTime() >= cutoffTime);
   const analysis = runTrendAnalysis(filtered, db.creators);
-  if (!db.trendsCache) db.trendsCache = {};
-  db.trendsCache[periodDays] = {
-    shorts: analysis.shorts,
-    audios: analysis.audios
-  };
   return {
     shorts: analysis.shorts,
     audios: analysis.audios,
@@ -1671,10 +1644,15 @@ app.post("/api/creators", async (req, res) => {
   };
   db.creators.push(newCreator);
   saveDb(db, req);
-  upsertCreatorInFirestore(newCreator).catch((err) => console.error("[Firestore] Creator upsert error:", err));
+  lastHydratedAt = Date.now();
+  try {
+    await upsertCreatorInFirestore(newCreator);
+  } catch (err) {
+    console.error("[Firestore] Creator upsert error:", err);
+  }
   res.status(201).json(newCreator);
 });
-app.put("/api/creators/:id", (req, res) => {
+app.put("/api/creators/:id", async (req, res) => {
   if (!verifyAdmin(req, res)) return;
   const db = loadDb(req);
   const { id } = req.params;
@@ -1707,10 +1685,15 @@ app.put("/api/creators/:id", (req, res) => {
   };
   db.creators[creatorIdx] = updatedCreator;
   saveDb(db, req);
-  upsertCreatorInFirestore(updatedCreator).catch((err) => console.error("[Firestore] Creator update error:", err));
+  lastHydratedAt = Date.now();
+  try {
+    await upsertCreatorInFirestore(updatedCreator);
+  } catch (err) {
+    console.error("[Firestore] Creator update error:", err);
+  }
   res.json(updatedCreator);
 });
-app.delete("/api/creators/:id", (req, res) => {
+app.delete("/api/creators/:id", async (req, res) => {
   if (!verifyAdmin(req, res)) return;
   const db = loadDb(req);
   const { id } = req.params;
@@ -1742,14 +1725,19 @@ app.delete("/api/creators/:id", (req, res) => {
     });
   }
   saveDb(db, req);
-  deleteCreatorFromFirestore(id).catch((err) => console.error("[Firestore] Creator delete error:", err));
+  lastHydratedAt = Date.now();
+  try {
+    await deleteCreatorFromFirestore(id);
+  } catch (err) {
+    console.error("[Firestore] Creator delete error:", err);
+  }
   res.json({ success: true, message: `Creator ${id} successfully removed, and all associated shorts purged/re-analyzed.` });
 });
 app.get("/api/settings", (req, res) => {
   const db = loadDb(req);
   res.json(db.settings);
 });
-app.put("/api/settings", (req, res) => {
+app.put("/api/settings", async (req, res) => {
   const db = loadDb(req);
   const { creatorLimit, periodDays, youtubeApiKeyPrimary, youtubeApiKeyBackup } = req.body;
   db.settings = {
@@ -1770,7 +1758,12 @@ app.put("/api/settings", (req, res) => {
   db.shorts = analysisResult.shorts;
   db.audios = analysisResult.audios;
   saveDb(db, req);
-  upsertSettingsInFirestore(db.settings).catch((err) => console.error("[Firestore] Settings update error:", err));
+  lastHydratedAt = Date.now();
+  try {
+    await upsertSettingsInFirestore(db.settings);
+  } catch (err) {
+    console.error("[Firestore] Settings update error:", err);
+  }
   res.json(db.settings);
 });
 app.get("/api/trending/audio", (req, res) => {
@@ -2091,7 +2084,6 @@ async function performFullFetchRefresh(triggerType) {
           localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Running Gemini AI audio analysis on ${creatorNewShorts.length} brand new Shorts...`);
           saveDb(localDb);
           const analyzedNewShorts = await analyzeShortsAudioWithGemini(creatorNewShorts);
-          allFetchedShorts = allFetchedShorts.filter((s) => s.creatorId !== creator.id);
           allFetchedShorts.push(...analyzedNewShorts);
           localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Successfully loaded and analyzed ${creatorNewShorts.length} new Shorts from ${creator.name}.`);
           creator.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
@@ -2174,26 +2166,39 @@ async function performFullFetchRefresh(triggerType) {
   const durationSec = parseFloat(((Date.now() - startTime) / 1e3).toFixed(1));
   const timestampStr = (/* @__PURE__ */ new Date()).toISOString();
   let jobStatus = "failed";
+  let persistenceStatus = "PERSISTENCE_FAILED";
+  let firestorePersisted = false;
   if (validation.valid) {
-    jobStatus = "success";
     localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Validation Passed: Yes`);
-    localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Stage: Saving Database`);
-    localDb.rawShorts = allFetchedShorts;
-    localDb.trendsCache = trendsCache;
-    localDb.shorts = activeTrend.shorts;
-    localDb.audios = activeTrend.audios;
-    localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Database Updated: Yes`);
-    try {
-      await upsertShortsInFirestore(allFetchedShorts);
-      if (activeTrend && activeTrend.audios) {
-        await upsertAudiosInFirestore(activeTrend.audios);
-      }
-      await saveTrendsCacheToFirestore(trendsCache);
-    } catch (err) {
-      console.error("[Firestore] Shorts/audios persist error:", err);
+    localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Stage: Persisting to Firestore (Authoritative Single Source of Truth)...`);
+    const [shortsPersistRes, audiosPersistRes] = await Promise.all([
+      upsertShortsInFirestore(allFetchedShorts),
+      activeTrend && activeTrend.audios ? upsertAudiosInFirestore(activeTrend.audios) : Promise.resolve({ success: true, count: 0, error: void 0 })
+    ]);
+    firestorePersisted = shortsPersistRes.success && audiosPersistRes.success;
+    if (firestorePersisted) {
+      jobStatus = "success";
+      persistenceStatus = "FETCH_SUCCESS_PERSISTED";
+      localDb.rawShorts = allFetchedShorts;
+      localDb.trendsCache = trendsCache;
+      localDb.shorts = activeTrend.shorts;
+      localDb.audios = activeTrend.audios;
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Firestore Persistence: SUCCESS (${shortsPersistRes.count} shorts, ${audiosPersistRes.count} audios written)`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Result: FETCH_SUCCESS_PERSISTED`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Database Updated: Yes`);
+    } else {
+      jobStatus = "failed";
+      persistenceStatus = "PERSISTENCE_FAILED";
+      const errMsg = shortsPersistRes.error || audiosPersistRes.error || "Firestore write error";
+      console.error(`[Refresh Job] Firestore persistence failed: ${errMsg}`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Firestore Persistence FAILED: ${errMsg}`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Result: PERSISTENCE_FAILED`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Stage: Saving Database skipped. Old cache remains protected.`);
+      localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Database Updated: No`);
     }
   } else {
     jobStatus = "failed";
+    persistenceStatus = "PERSISTENCE_FAILED";
     const validationError = validation.error || "Validation failed";
     localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Validation Passed: No`);
     localDb.refreshStatus.logs.push(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] ERROR: ${validationError}`);
@@ -2222,8 +2227,9 @@ async function performFullFetchRefresh(triggerType) {
   localDb.refreshStatus.logs.push(`Duplicate Audios Merged: ${stats.duplicateAudiosMerged}`);
   localDb.refreshStatus.logs.push(`Successful API Requests: ${metrics.successfulRequestsCount}`);
   localDb.refreshStatus.logs.push(`Failed API Requests:     ${metrics.failedRequestsCount}`);
-  localDb.refreshStatus.logs.push(`Database Updated:        ${validation.valid ? "Yes" : "No"}`);
+  localDb.refreshStatus.logs.push(`Database Updated:        ${firestorePersisted ? "Yes" : "No"}`);
   localDb.refreshStatus.logs.push(`Validation Passed:       ${validation.valid ? "Yes" : "No"}`);
+  localDb.refreshStatus.logs.push(`Firestore Persisted:     ${firestorePersisted ? "Yes (FETCH_SUCCESS_PERSISTED)" : "No (PERSISTENCE_FAILED)"}`);
   localDb.refreshStatus.logs.push(`Processing Time:         ${durationSec} seconds`);
   localDb.refreshStatus.logs.push(`Last Updated:            ${new Date(timestampStr).toLocaleString()}`);
   localDb.refreshStatus.logs.push(`=================================
@@ -2248,6 +2254,8 @@ async function performFullFetchRefresh(triggerType) {
     startTime: new Date(startTime).toISOString(),
     endTime: timestampStr,
     status: jobStatus,
+    persistenceStatus,
+    firestorePersisted,
     durationSec,
     creatorsProcessed: enabledCreators.length,
     videosProcessed: allFetchedShorts.length,
@@ -2259,7 +2267,7 @@ async function performFullFetchRefresh(triggerType) {
     duplicateAudiosMerged: stats.duplicateAudiosMerged,
     successfulRequestsCount: metrics.successfulRequestsCount,
     failedRequestsCount: metrics.failedRequestsCount,
-    databaseUpdated: validation.valid,
+    databaseUpdated: firestorePersisted,
     validationPassed: validation.valid,
     detailedErrors: metrics.detailedErrors
   };
@@ -2268,16 +2276,17 @@ async function performFullFetchRefresh(triggerType) {
   }
   localDb.fetchHistory = [newLog, ...localDb.fetchHistory].slice(0, 50);
   saveDb(localDb);
+  lastHydratedAt = Date.now();
   try {
-    await appendSyncLogInFirestore(newLog);
-    await saveRefreshStatusToFirestore(localDb.refreshStatus);
-  } catch (err) {
-    console.error("[Firestore] Sync log/status persist error:", err);
+    await Promise.all([
+      appendSyncLogInFirestore(newLog),
+      saveRefreshStatusToFirestore(localDb.refreshStatus)
+    ]);
+  } catch (logErr) {
+    console.error("[Firestore] Error saving sync log or refresh status:", logErr);
   }
-  hasHydratedFromFirestore = true;
-  lastFirestoreSyncTimestamp = Date.now();
   return {
-    success: jobStatus === "success",
+    success: jobStatus === "success" && firestorePersisted,
     totalCreators: enabledCreators.length,
     totalVideos: allFetchedShorts.length,
     totalTrendingAudios: activeTrend ? activeTrend.audios.length : 0,
@@ -2287,16 +2296,23 @@ async function performFullFetchRefresh(triggerType) {
 app.post("/api/refresh", async (req, res) => {
   if (!verifyAdmin(req, res)) return;
   const db = loadDb(req);
-  if (db.refreshStatus.status === "running") {
+  const { force } = req.body || {};
+  const isForce = force === true || req.query.force === "true";
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || Date.now() - lastRunTime > 10 * 60 * 1e3;
+  if (db.refreshStatus.status === "running" && !isForce && !isStale) {
     return res.status(400).json({ error: "Refresh is already running" });
+  }
+  if (isForce || isStale) {
+    console.log("[Refresh] Bypassing lock due to force=true or stale job (>10m).");
+    db.refreshStatus.status = "idle";
   }
   if (process.env.VERCEL) {
     try {
       const result = await performFullFetchRefresh("manual");
-      return res.json({ message: "Refresh job completed successfully.", status: "idle", result });
+      return res.json({ message: "Refresh completed successfully.", result, status: "idle" });
     } catch (err) {
-      console.error("Vercel manual refresh failed:", err);
-      return res.status(500).json({ error: err.message || "Refresh failed" });
+      return res.status(500).json({ error: "Refresh execution failed: " + (err.message || String(err)) });
     }
   }
   performFullFetchRefresh("manual").catch((err) => {
@@ -2304,20 +2320,40 @@ app.post("/api/refresh", async (req, res) => {
   });
   res.json({ message: "Refresh job triggered successfully.", status: "running" });
 });
+app.post(["/api/refresh/reset", "/api/refresh/cancel"], async (req, res) => {
+  const db = loadDb(req);
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || Date.now() - lastRunTime > 10 * 60 * 1e3;
+  if (!isStale && !verifyAdmin(req, res)) return;
+  db.refreshStatus = {
+    status: "idle",
+    progress: 100,
+    lastRun: (/* @__PURE__ */ new Date()).toISOString(),
+    logs: [
+      ...(db.refreshStatus?.logs || []).slice(-20),
+      `[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Engine manually reset.`
+    ]
+  };
+  saveDb(db, req);
+  lastHydratedAt = Date.now();
+  await saveRefreshStatusToFirestore(db.refreshStatus);
+  res.json({ message: "Trend Analysis Engine successfully reset to idle.", status: "idle" });
+});
 app.get("/api/refresh", async (req, res) => {
   const isVercelCron = req.headers["x-vercel-cron"] === "1";
   if (!isVercelCron && !verifyAdmin(req, res)) return;
   const db = loadDb(req);
-  if (db.refreshStatus.status === "running") {
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || Date.now() - lastRunTime > 10 * 60 * 1e3;
+  if (db.refreshStatus.status === "running" && !isStale) {
     return res.status(400).json({ error: "Refresh is already running" });
   }
-  if (process.env.VERCEL) {
+  if (process.env.VERCEL || isVercelCron) {
     try {
       const result = await performFullFetchRefresh("scheduled");
-      return res.json({ message: "Scheduled refresh completed successfully.", status: "idle", result });
+      return res.json({ message: "Scheduled refresh completed successfully.", result, status: "idle" });
     } catch (err) {
-      console.error("Vercel scheduled refresh failed:", err);
-      return res.status(500).json({ error: err.message || "Scheduled refresh failed" });
+      return res.status(500).json({ error: "Scheduled refresh failed: " + (err.message || String(err)) });
     }
   }
   performFullFetchRefresh("scheduled").catch((err) => {
@@ -2325,8 +2361,18 @@ app.get("/api/refresh", async (req, res) => {
   });
   res.json({ message: "Scheduled refresh job triggered successfully.", status: "running" });
 });
-app.get("/api/fetch-info", (req, res) => {
+app.get("/api/fetch-info", async (req, res) => {
   const db = loadDb(req);
+  if (!db.fetchHistory || db.fetchHistory.length <= 1) {
+    try {
+      const remoteLogs = await fetchSyncLogsFromFirestore(50);
+      if (remoteLogs && remoteLogs.length > 0) {
+        db.fetchHistory = remoteLogs;
+      }
+    } catch (e) {
+      console.warn("[Firestore] Failed to query sync_logs for /api/fetch-info:", e);
+    }
+  }
   const latestLog = db.fetchHistory && db.fetchHistory.length > 0 ? db.fetchHistory[0] : null;
   const lastSuccessLog = db.fetchHistory ? db.fetchHistory.find((h) => h.status === "success") : null;
   res.json({
@@ -2351,20 +2397,21 @@ app.get("/api/db-stats", (req, res) => {
   res.json({
     totalCreators: db.creators.length,
     activeCreators: db.creators.filter((c) => c.enabled).length,
-    totalShorts: db.shorts.length,
+    totalShorts: db.rawShorts && db.rawShorts.length > 0 ? db.rawShorts.length : db.shorts.length,
+    activeShorts: db.shorts.length,
     totalAudios: db.audios.length,
-    databaseSize: fileStats ? `${(fileStats.size / 1024).toFixed(2)} KB` : "0 KB",
+    databaseSize: fileStats ? `${(fileStats.size / 1024).toFixed(2)} KB` : "Cloud Hosted",
     lastModified: fileStats ? fileStats.mtime : (/* @__PURE__ */ new Date()).toISOString(),
     logsCount: db.apiLogs.length,
     firestoreConnected: isFirestoreAvailable(),
-    storageEngine: isFirestoreAvailable() ? "Firebase Firestore (Cloud Persistent)" : "Local JSON (Fallback)"
+    storageEngine: isFirestoreAvailable() ? "Firebase Firestore (Cloud Persistent Authoritative)" : "Local JSON (Fallback)"
   });
 });
 app.get("/api/logs", (req, res) => {
   const db = loadDb(req);
   res.json(db.apiLogs);
 });
-app.post("/api/creators/import", (req, res) => {
+app.post("/api/creators/import", async (req, res) => {
   if (!verifyAdmin(req, res)) return;
   const db = loadDb(req);
   const { ids } = req.body;
@@ -2401,7 +2448,12 @@ app.post("/api/creators/import", (req, res) => {
   });
   if (added.length > 0) {
     saveDb(db, req);
-    added.forEach((c) => upsertCreatorInFirestore(c).catch((err) => console.error("[Firestore] Creator import error:", err)));
+    lastHydratedAt = Date.now();
+    try {
+      await Promise.all(added.map((c) => upsertCreatorInFirestore(c)));
+    } catch (err) {
+      console.error("[Firestore] Creator import error:", err);
+    }
   }
   res.json({
     message: `Import complete. Added ${added.length} creators, skipped ${skipped.length} duplicates, rejected ${invalid.length} invalid formats.`,
@@ -2410,55 +2462,89 @@ app.post("/api/creators/import", (req, res) => {
     invalid
   });
 });
+var handlePersistenceDiagnostics = async (req, res) => {
+  const db = loadDb(req);
+  const firestoreReady = isFirestoreAvailable();
+  let liveFirestoreCounts = {
+    creators: -1,
+    rawShorts: -1,
+    audios: -1,
+    syncLogs: -1
+  };
+  let firestoreTestSuccess = false;
+  if (firestoreReady) {
+    try {
+      firestoreTestSuccess = await testFirestoreConnection();
+      const [remoteC, remoteS, remoteA, remoteL] = await Promise.all([
+        fetchCreatorsFromFirestore(),
+        fetchRawShortsFromFirestore(),
+        fetchAudiosFromFirestore(),
+        fetchSyncLogsFromFirestore(100)
+      ]);
+      liveFirestoreCounts = {
+        creators: remoteC ? remoteC.length : 0,
+        rawShorts: remoteS ? remoteS.length : 0,
+        audios: remoteA ? remoteA.length : 0,
+        syncLogs: remoteL ? remoteL.length : 0
+      };
+    } catch (e) {
+      console.error("[Diagnostics] Failed to sample live Firestore counts:", e);
+    }
+  }
+  const latestLog = db.fetchHistory && db.fetchHistory.length > 0 ? db.fetchHistory[0] : null;
+  res.json({
+    status: firestoreReady && firestoreTestSuccess ? "HEALTHY" : "DEGRADED",
+    firestoreConnected: firestoreReady,
+    firestoreConnectivityVerified: firestoreTestSuccess,
+    persistenceMode: "FIRESTORE_PRIMARY",
+    sourceOfTruth: "Firebase Firestore (Cloud Persistent Authoritative)",
+    environment: process.env.VERCEL ? "Vercel Serverless" : "Persistent Node Server",
+    lastHydratedAt: new Date(lastHydratedAt).toISOString(),
+    runtimeCacheCounts: {
+      creators: db.creators.length,
+      rawShorts: (db.rawShorts || []).length,
+      activeShorts: db.shorts.length,
+      audios: db.audios.length,
+      syncLogs: (db.fetchHistory || []).length
+    },
+    firestoreLiveCounts: liveFirestoreCounts,
+    lastPersistedSyncLog: latestLog ? {
+      id: latestLog.id,
+      endTime: latestLog.endTime,
+      status: latestLog.status,
+      persistenceStatus: latestLog.persistenceStatus || "FETCH_SUCCESS_PERSISTED",
+      firestorePersisted: latestLog.firestorePersisted ?? true
+    } : null,
+    storageEngine: firestoreReady ? "Firebase Firestore (Authoritative Single Source of Truth)" : "Local JSON / In-Memory (Fallback)"
+  });
+};
+app.get("/api/admin/persistence-status", handlePersistenceDiagnostics);
+app.get("/api/diagnostics/persistence", handlePersistenceDiagnostics);
+app.post("/api/admin/reseed", async (req, res) => {
+  if (!verifyAdmin(req, res)) return;
+  const { confirm } = req.body || {};
+  if (confirm !== true && req.query.confirm !== "true") {
+    return res.status(400).json({ error: "Explicit confirmation required: pass 'confirm: true' in request body to reseed." });
+  }
+  const result = await seedInitialDatabaseToFirestore();
+  res.json({
+    message: "Database explicitly reseeded to Firestore.",
+    creatorsCount: result.creators.length,
+    shortsCount: result.rawShorts?.length,
+    audiosCount: result.audios?.length
+  });
+});
 async function startServer() {
   try {
     initFirestore();
-    console.log("[Firestore] Connecting to cloud persistence layer...");
-    const synced = await syncFromFirestore(true);
-    const db = loadDb();
-    if (!synced || !db.rawShorts || db.rawShorts.length === 0) {
-      console.log("[Firestore] Cloud database is empty. Bootstrapping initial records...");
-      await migrateLocalDataToFirestore(db);
-      await syncFromFirestore(true);
-    }
+    console.log("[Persistence] Initializing Trend Finder with Firestore as authoritative source of truth...");
+    await ensureFirestoreHydrated();
   } catch (firestoreBootErr) {
-    console.error("[Firestore] Boot sync/migration error:", firestoreBootErr);
+    console.error("[Persistence] Boot hydration error:", firestoreBootErr);
   }
   setInterval(() => {
-    syncFromFirestore(false).catch((e) => console.warn("[Firestore Sync Interval]", e));
+    ensureFirestoreHydrated(true).catch((e) => console.warn("[Firestore Sync Interval]", e));
   }, 6e4);
-  try {
-    const db = loadDb();
-    if (db && (!db.trendsCache || Object.keys(db.trendsCache).length === 0)) {
-      console.log("Populating trendsCache from rawShorts on boot...");
-      const rawShorts = db.rawShorts && db.rawShorts.length > 0 ? db.rawShorts : db.shorts && db.shorts.length > 0 ? db.shorts : generateMockShorts(db.creators, 30);
-      const periods = [7, 14, 21, 30];
-      const bootNow = /* @__PURE__ */ new Date();
-      const initialTrendsCache = {};
-      periods.forEach((pDays) => {
-        const cutoffTime = bootNow.getTime() - pDays * 24 * 60 * 60 * 1e3;
-        const filteredShorts = rawShorts.filter((s) => new Date(s.publishedDate).getTime() >= cutoffTime);
-        const analysisResult = runTrendAnalysis(filteredShorts, db.creators);
-        initialTrendsCache[pDays] = {
-          shorts: analysisResult.shorts,
-          audios: analysisResult.audios
-        };
-      });
-      db.trendsCache = initialTrendsCache;
-      const activeDays = db.settings?.periodDays || 7;
-      const activeTrend = initialTrendsCache[activeDays] || initialTrendsCache[7];
-      if (activeTrend) {
-        db.shorts = activeTrend.shorts;
-        db.audios = activeTrend.audios;
-      }
-      if (!db.fetchHistory) {
-        db.fetchHistory = [];
-      }
-      saveDb(db);
-    }
-  } catch (migErr) {
-    console.error("Cache verification error on startup:", migErr);
-  }
   console.log("[Scheduler] Initializing Daily automatic fetch scheduler at 3:00 AM...");
   cron.schedule("0 3 * * *", async () => {
     console.log("[Scheduler] Triggering automatic 3:00 AM Trend Refresh job...");

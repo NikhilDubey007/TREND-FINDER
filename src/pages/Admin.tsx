@@ -24,7 +24,8 @@ import {
   Clock,
   Edit2,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Square
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { Settings as SystemSettingsType, Creator } from "../types";
@@ -303,6 +304,22 @@ export default function Admin({ triggerNotification }: { triggerNotification: (m
       triggerNotification(err.response?.data?.error || "Failed to run Trend Finder Index.", "error");
     } finally {
       setTriggering(false);
+    }
+  };
+
+  const [resetting, setResetting] = useState(false);
+  const handleResetEngine = async () => {
+    setResetting(true);
+    try {
+      const headers = getHeaders();
+      await axios.post("/api/refresh/reset", {}, headers);
+      setPolling(false);
+      triggerNotification("Trend Indexing Engine reset to IDLE.", "success");
+      fetchFetchInfo();
+    } catch (err: any) {
+      triggerNotification(err.response?.data?.error || "Failed to reset engine.", "error");
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -840,14 +857,26 @@ export default function Admin({ triggerNotification }: { triggerNotification: (m
                 </p>
               </div>
 
-              <button
-                onClick={handleTriggerEngine}
-                disabled={fetchInfo?.currentStatus === "running" || triggering}
-                className="px-5 py-3 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 disabled:from-zinc-800 disabled:to-zinc-800 text-white font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer flex items-center gap-2 shadow-lg shadow-emerald-950/20 self-start md:self-auto"
-              >
-                <RefreshCw className={`h-4 w-4 ${fetchInfo?.currentStatus === "running" ? "animate-spin" : ""}`} />
-                {fetchInfo?.currentStatus === "running" ? "Crawler Running..." : "Fetch Latest Data Now"}
-              </button>
+              <div className="flex items-center gap-2.5 self-start md:self-auto flex-wrap">
+                {fetchInfo?.currentStatus === "running" && (
+                  <button
+                    onClick={handleResetEngine}
+                    disabled={resetting}
+                    className="px-4 py-3 bg-red-950/40 hover:bg-red-900/50 border border-red-800/60 hover:border-red-700 text-red-300 hover:text-white font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer flex items-center gap-2 shadow-lg shadow-red-950/20"
+                  >
+                    <Square className="h-3.5 w-3.5 text-red-400" />
+                    {resetting ? "Resetting..." : "Reset Stuck Engine"}
+                  </button>
+                )}
+                <button
+                  onClick={handleTriggerEngine}
+                  disabled={fetchInfo?.currentStatus === "running" || triggering}
+                  className="px-5 py-3 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 disabled:from-zinc-800 disabled:to-zinc-800 text-white font-bold text-xs uppercase tracking-wider rounded-xl transition cursor-pointer flex items-center gap-2 shadow-lg shadow-emerald-950/20"
+                >
+                  <RefreshCw className={`h-4 w-4 ${fetchInfo?.currentStatus === "running" ? "animate-spin" : ""}`} />
+                  {fetchInfo?.currentStatus === "running" ? "Crawler Running..." : "Fetch Latest Data Now"}
+                </button>
+              </div>
             </div>
 
             {fetchInfo?.currentStatus === "running" && (

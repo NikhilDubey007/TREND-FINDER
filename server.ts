@@ -1184,6 +1184,19 @@ async function ensureFirestoreHydrated(forceRefresh = false): Promise<DatabaseSc
             progress: 100
           };
 
+          // Auto-recovery: If job was left in "running" state for > 10 minutes, automatically reset it to idle
+          if (refreshStatus.status === "running") {
+            const lastRunTime = refreshStatus.lastRun ? new Date(refreshStatus.lastRun).getTime() : 0;
+            const isStale = !lastRunTime || (Date.now() - lastRunTime > 10 * 60 * 1000);
+            if (isStale) {
+              console.warn("[Persistence] Detected stale running engine job (>10m old). Automatically resetting status to idle.");
+              refreshStatus.status = "idle";
+              refreshStatus.progress = 100;
+              refreshStatus.logs.push(`[${new Date().toLocaleTimeString()}] Engine automatically reset to idle (previous job timed out).`);
+              saveRefreshStatusToFirestore(refreshStatus).catch(e => console.warn("[Firestore] Reset status error:", e));
+            }
+          }
+
           // Compute multi-timeframe cached views dynamically from rawShorts
           const periods = [7, 14, 21, 30];
           const trendsCache: any = {};
@@ -2594,11 +2607,33 @@ app.post("/api/refresh", async (req, res) => {
   if (!verifyAdmin(req, res)) return;
 
   const db = loadDb(req);
-  if (db.refreshStatus.status === "running") {
+  const { force } = req.body || {};
+  const isForce = force === true || req.query.force === "true";
+
+  // Check if previous run is stale (> 10 minutes)
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || (Date.now() - lastRunTime > 10 * 60 * 1000);
+
+  if (db.refreshStatus.status === "running" && !isForce && !isStale) {
     return res.status(400).json({ error: "Refresh is already running" });
   }
 
-  // Trigger background job async
+  if (isForce || isStale) {
+    console.log("[Refresh] Bypassing lock due to force=true or stale job (>10m).");
+    db.refreshStatus.status = "idle";
+  }
+
+  // On Vercel serverless, await the job so execution doesn't freeze prematurely
+  if (process.env.VERCEL) {
+    try {
+      const result = await performFullFetchRefresh("manual");
+      return res.json({ message: "Refresh completed successfully.", result, status: "idle" });
+    } catch (err: any) {
+      return res.status(500).json({ error: "Refresh execution failed: " + (err.message || String(err)) });
+    }
+  }
+
+  // Trigger background job async on persistent Node servers
   performFullFetchRefresh("manual").catch(err => {
     console.error("Manual refresh background job failed:", err);
   });
@@ -2606,14 +2641,51 @@ app.post("/api/refresh", async (req, res) => {
   res.json({ message: "Refresh job triggered successfully.", status: "running" });
 });
 
-// 11.1. GET /api/refresh (Allows triggering via Vercel Cron or external scheduler)
+// 11.1. POST /api/refresh/reset & POST /api/refresh/cancel (Reset stuck engine)
+app.post(["/api/refresh/reset", "/api/refresh/cancel"], async (req, res) => {
+  const db = loadDb(req);
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || (Date.now() - lastRunTime > 10 * 60 * 1000);
+
+  // If not stale (>10m), require admin verification
+  if (!isStale && !verifyAdmin(req, res)) return;
+
+  db.refreshStatus = {
+    status: "idle",
+    progress: 100,
+    lastRun: new Date().toISOString(),
+    logs: [
+      ...(db.refreshStatus?.logs || []).slice(-20),
+      `[${new Date().toLocaleTimeString()}] Engine manually reset.`
+    ]
+  };
+  saveDb(db, req);
+  lastHydratedAt = Date.now();
+  await saveRefreshStatusToFirestore(db.refreshStatus);
+
+  res.json({ message: "Trend Analysis Engine successfully reset to idle.", status: "idle" });
+});
+
+// 11.2. GET /api/refresh (Allows triggering via Vercel Cron or external scheduler)
 app.get("/api/refresh", async (req, res) => {
   const isVercelCron = req.headers["x-vercel-cron"] === "1";
   if (!isVercelCron && !verifyAdmin(req, res)) return;
 
   const db = loadDb(req);
-  if (db.refreshStatus.status === "running") {
+  const lastRunTime = db.refreshStatus.lastRun ? new Date(db.refreshStatus.lastRun).getTime() : 0;
+  const isStale = !lastRunTime || (Date.now() - lastRunTime > 10 * 60 * 1000);
+
+  if (db.refreshStatus.status === "running" && !isStale) {
     return res.status(400).json({ error: "Refresh is already running" });
+  }
+
+  if (process.env.VERCEL || isVercelCron) {
+    try {
+      const result = await performFullFetchRefresh("scheduled");
+      return res.json({ message: "Scheduled refresh completed successfully.", result, status: "idle" });
+    } catch (err: any) {
+      return res.status(500).json({ error: "Scheduled refresh failed: " + (err.message || String(err)) });
+    }
   }
 
   performFullFetchRefresh("scheduled").catch(err => {
